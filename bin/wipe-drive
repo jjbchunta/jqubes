@@ -4,31 +4,46 @@
 # Best run in sys-usb or whatever your equivalent is.
 # The only required parameter is the `/dev` path to the drive.
 # Use the `-q` flag if you want this to be a quick format.
+# For filesystem, it defaults to exFAT, but you can set -e for ext4, -x for exFAT, or -f <type> for anything else.
 
-# 1. Enforce root privileges and strict error handling
 if [ "$EUID" -ne 0 ]; then
   echo "Error: This script must be run as root (use sudo)."
   exit 1
 fi
 
-# Exit immediately if any subsequent command fails
 set -e
-# Print a helpful message if the script crashes via set -e
 trap 'echo "[!] Error: A command failed. Script aborted to prevent damage." >&2' ERR
 
-# 2. Parse Arguments
+# Default Settings
 QUICK_WIPE=0
+FS_TYPE="exfat"
 DEVICE=""
 
+# Argument Parser
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -q|--quick)
             QUICK_WIPE=1
             shift
             ;;
+        -e|--ext4)
+            FS_TYPE="ext4"
+            shift
+            ;;
+        -x|--exfat)
+            FS_TYPE="exfat"
+            shift
+            ;;
+        -f|--fs)
+            FS_TYPE="$2"
+            shift 2
+            ;;
         -*)
             echo "Error: Unknown option: $1"
-            echo "Usage: sudo $0 [-q] <drive_path>"
+            echo "Usage: sudo $0 [-q] [-e | -x | -f <fs_type>] <drive_path>"
+            echo "Example 1: sudo $0 -q /dev/sda          (Quick wipe, defaults to exFAT)"
+            echo "Example 2: sudo $0 -e /dev/sda          (Zero wipe, formats to ext4)"
+            echo "Example 3: sudo $0 -q -f ntfs /dev/sda  (Quick wipe, formats to NTFS)"
             exit 1
             ;;
         *)
@@ -38,10 +53,8 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-# 3. Validate input
 if [ -z "$DEVICE" ]; then
-  echo "Usage: sudo $0 [-q] <drive_path>"
-  echo "Example: sudo $0 -q /dev/xvdi"
+  echo "Usage: sudo $0 [-q] [-e | -x | -f <fs_type>] <drive_path>"
   exit 1
 fi
 
@@ -50,13 +63,20 @@ if [ ! -b "$DEVICE" ]; then
   exit 1
 fi
 
+# Ensure the requested mkfs utility is actually installed
+if ! command -v mkfs."$FS_TYPE" &> /dev/null; then
+    echo "[!] Error: 'mkfs.$FS_TYPE' command not found."
+    echo "Please install the required formatting utilities for $FS_TYPE."
+    exit 1
+fi
+
 BASENAME=$(basename "$DEVICE")
 ROTATIONAL=$(cat "/sys/block/$BASENAME/queue/rotational" 2>/dev/null || echo "1")
 DISCARD_GRAN=$(cat "/sys/block/$BASENAME/queue/discard_granularity" 2>/dev/null || echo "0")
 
-# 4. Print Info and Confirm
 echo "==================== DRIVE INFO ===================="
 echo "Target device: $DEVICE"
+echo "Filesystem:    $FS_TYPE"
 
 if [ "$ROTATIONAL" = "0" ]; then
     echo "Type: Solid State / Flash (Non-rotational)"
@@ -71,17 +91,15 @@ else
 fi
 echo "===================================================="
 
-# '|| true' prevents 'set -e' from crashing the script if lsblk fails for some reason
 lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$DEVICE" || true
 echo ""
 
 if [ "$QUICK_WIPE" -eq 1 ]; then
-    echo "WARNING: You are about to QUICK WIPE and format $DEVICE."
+    echo "WARNING: You are about to QUICK WIPE and format $DEVICE to $FS_TYPE."
 else
-    echo "WARNING: You are about to COMPLETELY ZERO OUT and format $DEVICE."
+    echo "WARNING: You are about to COMPLETELY ZERO OUT and format $DEVICE to $FS_TYPE."
 fi
 
-# Temporarily disable 'set -e' for the read prompt so hitting Ctrl+C doesn't trigger the trap message
 set +e
 read -p "Type 'WIPE' to confirm: " confirm
 set -e
@@ -91,9 +109,9 @@ if [ "$confirm" != "WIPE" ]; then
   exit 1
 fi
 
-# 5. Execute Unmount and Wipe
+# Execute Unmount and Wipe
 echo "[*] Unmounting existing partitions..."
-umount ${DEVICE}* 2>/dev/null || true  # Ignore errors if it's already unmounted
+umount ${DEVICE}* 2>/dev/null || true
 
 echo "[*] Wiping filesystem signatures..."
 wipefs -a "$DEVICE" || true
@@ -109,12 +127,16 @@ else
     dd if=/dev/zero of="$DEVICE" bs=4M status=progress
 fi
 
-# 6. Format and Partition
+# Format and Partition
 echo "[*] Creating new GPT partition table..."
 parted -s "$DEVICE" mklabel gpt
-parted -s "$DEVICE" mkpart primary ext4 0% 100%
+parted -s "$DEVICE" mkpart primary 0% 100%
 
-# Force kernel to re-read partition table
+# If it's a Windows-centric filesystem, add the msftdata flag
+if [[ "$FS_TYPE" == "exfat" || "$FS_TYPE" == "ntfs" || "$FS_TYPE" == "vfat" || "$FS_TYPE" == "fat32" ]]; then
+    parted -s "$DEVICE" set 1 msftdata on
+fi
+
 partprobe "$DEVICE"
 sleep 2
 
@@ -124,25 +146,28 @@ else
     PARTITION="${DEVICE}1"
 fi
 
-echo "[*] Formatting $PARTITION to ext4..."
-mkfs.ext4 -q "$PARTITION"
+echo "[*] Formatting $PARTITION to $FS_TYPE..."
+if [ "$FS_TYPE" == "exfat" ]; then
+    mkfs.exfat -n "USB_DRIVE" "$PARTITION"
+elif [ "$FS_TYPE" == "ext4" ]; then
+    mkfs.ext4 -q "$PARTITION"
+else
+    # Generic command for other filesystems (btrfs, xfs, etc.)
+    mkfs."$FS_TYPE" "$PARTITION"
+fi
 
-# 7. Fix Permissions
-echo "[*] Granting write permissions to standard users..."
-# Create a temporary mount point using the script's process ID ($$) to ensure a unique name
-TMP_MOUNT="/mnt/wipe_tmp_$$"
-mkdir -p "$TMP_MOUNT"
-
-# Mount the new partition
-mount "$PARTITION" "$TMP_MOUNT"
-
-# Change ownership to UID 1000 (the standard 'user' in Qubes OS and most Linux distros)
-chown -R 1000:1000 "$TMP_MOUNT"
-# Grant read/write/execute permissions to everyone so the drive works on any Linux machine
-chmod -R 777 "$TMP_MOUNT"
-
-# Unmount and clean up
-umount "$TMP_MOUNT"
-rmdir "$TMP_MOUNT"
+# Fix Linux permissions ONLY if a native Linux filesystem was chosen
+if [[ "$FS_TYPE" == "ext4" || "$FS_TYPE" == "btrfs" || "$FS_TYPE" == "xfs" ]]; then
+    echo "[*] Native Linux FS detected. Granting write permissions to standard users..."
+    TMP_MOUNT="/mnt/wipe_tmp_$$"
+    mkdir -p "$TMP_MOUNT"
+    
+    mount "$PARTITION" "$TMP_MOUNT"
+    chown -R 1000:1000 "$TMP_MOUNT"
+    chmod -R 777 "$TMP_MOUNT"
+    
+    umount "$TMP_MOUNT"
+    rmdir "$TMP_MOUNT"
+fi
 
 echo "[+] Success! $DEVICE is ready for use."
