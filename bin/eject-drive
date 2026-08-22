@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# Safely eject a /dev drive.
+
+# Enforce root privileges
+if [ "$EUID" -ne 0 ]; then
+  echo "Error: This script must be run as root (use sudo)."
+  exit 1
+fi
+
+DEVICE=$1
+
+if [ -z "$DEVICE" ] || [ ! -b "$DEVICE" ]; then
+  echo "Usage: sudo $0 <drive_path>"
+  echo "Example: sudo $0 /dev/sda"
+  exit 1
+fi
+
+echo "[*] Flushing data cache to disk (syncing)..."
+# 'sync' forces the kernel to write all pending operations to the physical drive.
+# If the drive is slow and you transferred a large file, this command might pause for a few seconds.
+sync
+
+echo "[*] Unmounting all partitions on $DEVICE..."
+umount ${DEVICE}* 2>/dev/null || true
+
+echo "[*] Powering down block device..."
+# udisksctl powers off the USB port gracefully so the drive can park its heads / flush its own controller
+udisksctl power-off -b "$DEVICE" 2>/dev/null || eject "$DEVICE"
+
+echo "[+] Success! $DEVICE is fully unmounted and powered down."
+echo "You may now safely unplug the drive."

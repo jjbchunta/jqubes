@@ -1,0 +1,40 @@
+#!/bin/bash
+
+# Check the health of a /dev drive.
+
+# Enforce root privileges
+if [ "$EUID" -ne 0 ]; then
+  echo "Error: This script must be run as root (use sudo)."
+  exit 1
+fi
+
+DEVICE=$1
+
+if [ -z "$DEVICE" ] || [ ! -b "$DEVICE" ]; then
+  echo "Usage: sudo $0 <drive_path>"
+  echo "Example: sudo $0 /dev/sda"
+  exit 1
+fi
+
+if ! command -v smartctl &> /dev/null; then
+    echo "[!] Error: 'smartctl' command not found."
+    echo "Please install smartmontools (e.g., sudo dnf install smartmontools)"
+    exit 1
+fi
+
+echo "==================== SMART HEALTH REPORT ===================="
+echo "Target: $DEVICE"
+echo "============================================================="
+
+# 1. Check overall health assessment
+echo -e "\n[*] Overall Health Status:"
+smartctl -H "$DEVICE" | grep -E "SMART overall-health|test result" || echo "Status not supported by this drive."
+
+# 2. Pull basic device info
+echo -e "\n[*] Device Information:"
+smartctl -i "$DEVICE" | grep -E "Model Family|Device Model|Serial Number|Firmware Version|User Capacity|Solid State Device"
+
+# 3. Pull crucial wear-and-tear metrics (Output varies between SSD/HDD/NVMe)
+echo -e "\n[*] Key Health Metrics (if available):"
+smartctl -A "$DEVICE" | grep -iE "(Reallocated_Sector|Media_Wearout|Power_On_Hours|Temperature|Percentage Used|Available Spare|Data Units Read|Data Units Written|Unsafe Shutdowns)" || echo "No extended metrics found."
+echo "============================================================="

@@ -5,12 +5,18 @@
 # The only required parameter is the `/dev` path to the drive.
 # Use the `-q` flag if you want this to be a quick format.
 
+# 1. Enforce root privileges and strict error handling
 if [ "$EUID" -ne 0 ]; then
   echo "Error: This script must be run as root (use sudo)."
   exit 1
 fi
 
-# 1. Parse Arguments
+# Exit immediately if any subsequent command fails
+set -e
+# Print a helpful message if the script crashes via set -e
+trap 'echo "[!] Error: A command failed. Script aborted to prevent damage." >&2' ERR
+
+# 2. Parse Arguments
 QUICK_WIPE=0
 DEVICE=""
 
@@ -32,7 +38,7 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-# 2. Validate input
+# 3. Validate input
 if [ -z "$DEVICE" ]; then
   echo "Usage: sudo $0 [-q] <drive_path>"
   echo "Example: sudo $0 -q /dev/xvdi"
@@ -45,10 +51,10 @@ if [ ! -b "$DEVICE" ]; then
 fi
 
 BASENAME=$(basename "$DEVICE")
-ROTATIONAL=$(cat "/sys/block/$BASENAME/queue/rotational" 2>/dev/null)
-DISCARD_GRAN=$(cat "/sys/block/$BASENAME/queue/discard_granularity" 2>/dev/null)
+ROTATIONAL=$(cat "/sys/block/$BASENAME/queue/rotational" 2>/dev/null || echo "1")
+DISCARD_GRAN=$(cat "/sys/block/$BASENAME/queue/discard_granularity" 2>/dev/null || echo "0")
 
-# 3. Print Info and Confirm
+# 4. Print Info and Confirm
 echo "==================== DRIVE INFO ===================="
 echo "Target device: $DEVICE"
 
@@ -65,7 +71,8 @@ else
 fi
 echo "===================================================="
 
-lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$DEVICE"
+# '|| true' prevents 'set -e' from crashing the script if lsblk fails for some reason
+lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$DEVICE" || true
 echo ""
 
 if [ "$QUICK_WIPE" -eq 1 ]; then
@@ -74,19 +81,22 @@ else
     echo "WARNING: You are about to COMPLETELY ZERO OUT and format $DEVICE."
 fi
 
+# Temporarily disable 'set -e' for the read prompt so hitting Ctrl+C doesn't trigger the trap message
+set +e
 read -p "Type 'WIPE' to confirm: " confirm
+set -e
 
 if [ "$confirm" != "WIPE" ]; then
   echo "Aborted by user. No changes were made."
   exit 1
 fi
 
-# 4. Execute Unmount and Wipe
+# 5. Execute Unmount and Wipe
 echo "[*] Unmounting existing partitions..."
-umount ${DEVICE}* 2>/dev/null
+umount ${DEVICE}* 2>/dev/null || true  # Ignore errors if it's already unmounted
 
 echo "[*] Wiping filesystem signatures..."
-wipefs -a "$DEVICE"
+wipefs -a "$DEVICE" || true
 
 if [ "$QUICK_WIPE" -eq 1 ]; then
     echo "[*] Quick Wipe: Overwriting the first 100MB..."
@@ -99,11 +109,12 @@ else
     dd if=/dev/zero of="$DEVICE" bs=4M status=progress
 fi
 
-# 5. Format and Partition
+# 6. Format and Partition
 echo "[*] Creating new GPT partition table..."
 parted -s "$DEVICE" mklabel gpt
 parted -s "$DEVICE" mkpart primary ext4 0% 100%
 
+# Force kernel to re-read partition table
 partprobe "$DEVICE"
 sleep 2
 
@@ -115,5 +126,23 @@ fi
 
 echo "[*] Formatting $PARTITION to ext4..."
 mkfs.ext4 -q "$PARTITION"
+
+# 7. Fix Permissions
+echo "[*] Granting write permissions to standard users..."
+# Create a temporary mount point using the script's process ID ($$) to ensure a unique name
+TMP_MOUNT="/mnt/wipe_tmp_$$"
+mkdir -p "$TMP_MOUNT"
+
+# Mount the new partition
+mount "$PARTITION" "$TMP_MOUNT"
+
+# Change ownership to UID 1000 (the standard 'user' in Qubes OS and most Linux distros)
+chown -R 1000:1000 "$TMP_MOUNT"
+# Grant read/write/execute permissions to everyone so the drive works on any Linux machine
+chmod -R 777 "$TMP_MOUNT"
+
+# Unmount and clean up
+umount "$TMP_MOUNT"
+rmdir "$TMP_MOUNT"
 
 echo "[+] Success! $DEVICE is ready for use."
