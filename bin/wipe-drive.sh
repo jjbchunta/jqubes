@@ -2,18 +2,40 @@
 
 # Zero out a drive / disk and format it for use.
 # Best run in sys-usb or whatever your equivalent is.
-# The only required parameter is the path to the drive found through lsblk.
+# The only required parameter is the `/dev` path to the drive.
+# Use the `-q` flag if you want this to be a quick format.
 
 if [ "$EUID" -ne 0 ]; then
   echo "Error: This script must be run as root (use sudo)."
   exit 1
 fi
 
-DEVICE=$1
+# 1. Parse Arguments
+QUICK_WIPE=0
+DEVICE=""
 
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -q|--quick)
+            QUICK_WIPE=1
+            shift
+            ;;
+        -*)
+            echo "Error: Unknown option: $1"
+            echo "Usage: sudo $0 [-q] <drive_path>"
+            exit 1
+            ;;
+        *)
+            DEVICE=$1
+            shift
+            ;;
+    esac
+done
+
+# 2. Validate input
 if [ -z "$DEVICE" ]; then
-  echo "Usage: sudo $0 <drive_path>"
-  echo "Example: sudo $0 /dev/xvdi"
+  echo "Usage: sudo $0 [-q] <drive_path>"
+  echo "Example: sudo $0 -q /dev/xvdi"
   exit 1
 fi
 
@@ -22,14 +44,11 @@ if [ ! -b "$DEVICE" ]; then
   exit 1
 fi
 
-# Extract just the device name (e.g., "xvdi" from "/dev/xvdi")
 BASENAME=$(basename "$DEVICE")
-
-# Gather drive capabilities from sysfs
 ROTATIONAL=$(cat "/sys/block/$BASENAME/queue/rotational" 2>/dev/null)
 DISCARD_GRAN=$(cat "/sys/block/$BASENAME/queue/discard_granularity" 2>/dev/null)
 
-# Print gathered info and warn the user
+# 3. Print Info and Confirm
 echo "==================== DRIVE INFO ===================="
 echo "Target device: $DEVICE"
 
@@ -46,11 +65,15 @@ else
 fi
 echo "===================================================="
 
-# Use lsblk to show the user the partitions before destroying them
 lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$DEVICE"
 echo ""
 
-echo "WARNING: You are about to DESTROY ALL DATA on $DEVICE."
+if [ "$QUICK_WIPE" -eq 1 ]; then
+    echo "WARNING: You are about to QUICK WIPE and format $DEVICE."
+else
+    echo "WARNING: You are about to COMPLETELY ZERO OUT and format $DEVICE."
+fi
+
 read -p "Type 'WIPE' to confirm: " confirm
 
 if [ "$confirm" != "WIPE" ]; then
@@ -58,14 +81,17 @@ if [ "$confirm" != "WIPE" ]; then
   exit 1
 fi
 
+# 4. Execute Unmount and Wipe
 echo "[*] Unmounting existing partitions..."
 umount ${DEVICE}* 2>/dev/null
 
 echo "[*] Wiping filesystem signatures..."
 wipefs -a "$DEVICE"
 
-# Determine the best wipe method based on our gathered info
-if [ "$ROTATIONAL" = "0" ] && [ -n "$DISCARD_GRAN" ] && [ "$DISCARD_GRAN" -gt 0 ]; then
+if [ "$QUICK_WIPE" -eq 1 ]; then
+    echo "[*] Quick Wipe: Overwriting the first 100MB..."
+    dd if=/dev/zero of="$DEVICE" bs=1M count=100 status=none
+elif [ "$ROTATIONAL" = "0" ] && [ -n "$DISCARD_GRAN" ] && [ "$DISCARD_GRAN" -gt 0 ]; then
     echo "[*] Fast Flash Erasure: Using blkdiscard..."
     blkdiscard -f "$DEVICE"
 else
@@ -73,6 +99,7 @@ else
     dd if=/dev/zero of="$DEVICE" bs=4M status=progress
 fi
 
+# 5. Format and Partition
 echo "[*] Creating new GPT partition table..."
 parted -s "$DEVICE" mklabel gpt
 parted -s "$DEVICE" mkpart primary ext4 0% 100%
